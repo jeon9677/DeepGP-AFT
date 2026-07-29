@@ -1,40 +1,41 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DeepGP-like Log-normal AFT with MC-Dropout
-===========================================
+DeepGP-like Log-normal AFT model with MC-Dropout + Uncertainty Quantification
+==============================================================================
 
-Stratified 50/20/30 split (train / val / test) via two-step stratification:
-  1. 70 % stratified  →  train_pool  vs  test
-  2. train_pool  →  stratified  5/7  train_core  and  2/7  val
-     (final proportions: 50 % / 20 % / 30 % of total)
+This module contains ONLY the model / training / evaluation / UQ code.
+Data generation is assumed to live elsewhere; every function here takes
+already-prepared arrays or DataFrames as input.
 
-The model is trained on train_core, validated on val, and evaluated on test.
+Expected data schema
+--------------------
+Each DataFrame (train / val / test) is expected to have:
+    x1, x2, ..., xp   : covariates
+    y                 : observed time = min(T, C, tau)
+    delta             : event indicator (1 = event, 0 = censored)
+    logT (optional)   : TRUE, uncensored log survival time. Only needed
+                         for full-sample predictive-interval coverage
+                         evaluation (an oracle quantity available in
+                         simulations). If absent, coverage falls back
+                         to event-only rows (where y == T exactly).
 
-Outputs (under ``simul/<setting>/``)
--------------------------------------
-  seed_<seed>_train.csv       raw training split
-  seed_<seed>_test.csv        raw test split
-  metrics_seed_<seed>.csv     per-seed evaluation metrics
-  metrics_summary.csv         aggregated metrics across all seeds
-
-Metrics
--------
-  rmse_logT            RMSE of log(T) on event-only rows
-  mae_logT             MAE  of log(T) on event-only rows
-  ipcw_rmse_logT       IPCW-weighted RMSE of log(T)
-  rmse_time_median     RMSE of median survival time T on event-only rows
-  mae_time_median      MAE  of median survival time T on event-only rows
-  cindex_median_ipcw   IPCW C-index using predicted median T
-  runtime_seconds      wall-clock training time per seed
+Module layout
+-------------
+  1. Model & loss           : build_deepgp_aft, aft_lognormal_nll
+  2. Predictive UQ          : predict_mu_sigma_uq, prediction_interval,
+                               coverage_at_alpha
+  3. IPCW evaluation metrics: c_index_ipcw_rstyle, ipcw_rmse_logT
+  4. Data-splitting utility : stratified_split
+  5. High-level pipeline    : fit_model, evaluate_model,
+                               train_and_evaluate  (glues everything
+                               together for one seed)
 """
 
 from __future__ import annotations
 
-import os
 import time
-import argparse
-from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -42,6 +43,7 @@ import tensorflow as tf
 from tensorflow.keras import layers as L, Model, Input
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from scipy.stats import norm
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -51,144 +53,207 @@ SQRT2 = tf.constant(np.sqrt(2.0), dtype=tf.float32)
 LOG_HALF = tf.math.log(tf.constant(0.5, dtype=tf.float32))
 
 
-# ---------------------------------------------------------------------------
-# Reproducibility
-# ---------------------------------------------------------------------------
 def set_seed(seed: int = 1000) -> None:
+    """Set numpy + tensorflow random seeds for reproducibility."""
     np.random.seed(seed)
     tf.random.set_seed(seed)
 
 
-# ---------------------------------------------------------------------------
-# Data generation
-# ---------------------------------------------------------------------------
-def make_ar1_cov(p: int, rho: float = 0.3) -> np.ndarray:
-    """AR(1) covariance matrix of size (p, p)."""
-    idx = np.arange(p)
-    return rho ** np.abs(idx[:, None] - idx[None, :])
-
-
-def g_nonlinear(X: np.ndarray) -> np.ndarray:
-    """Non-linear prognostic index used to generate log(T)."""
-    p = X.shape[1]
-
-    def _col(k):
-        return X[:, k] if k < p else 0.0
-
-    g = (
-        _col(0) * _col(1)
-        + 0.5 * (_col(2) ** 3)
-        + _col(3) * _col(4)
-        - 0.8 * _col(5)
-    )
-    if p > 6:
-        w = np.linspace(0.5, 0.1, num=p - 6)
-        g = g + (X[:, 6:] @ w)
-    return g
-
-
-def generate_correlated_data(
-    n: int = 1000,
-    p: int = 30,
-    sigma: float = 0.5,
-    tau: float = 7.0,
-    rho: float = 0.3,
-    seed: int = 1000,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+# ===========================================================================
+# 1. Model & loss
+# ===========================================================================
+def build_deepgp_aft(
+    input_dim: int,
+    width: int = 128,
+    depth: int = 3,
+    dropout: float = 0.2,
+) -> Model:
     """
-    Generate log-normal AFT survival data with AR(1) covariates.
+    Build the Deep-GP-like AFT network with MC-Dropout.
 
     Parameters
     ----------
-    n     : sample size
-    p     : number of covariates
-    sigma : variance of the log-normal error  (epsilon ~ N(0, sigma))
-    tau   : administrative censoring time
-    rho   : AR(1) correlation parameter
-    seed  : random seed
+    input_dim : number of covariates (p)
+    width     : hidden layer width
+    depth     : number of hidden (Dense + Dropout) blocks
+    dropout   : dropout rate, kept active at inference time (MC-Dropout)
 
     Returns
     -------
-    X          : (n, p) float32 covariates
-    y          : (n,)   float32 observed times  min(T, C, tau)
-    delta      : (n,)   float32 event indicators
-    mu_true    : (n,)   float32 true log(T) means
-    sigma_true : (n,)   float32 true log(T) std (constant = sqrt(sigma))
+    keras.Model that maps x -> [mu, raw_scale]
+        mu(x)         : predicted mean of log(T)
+        raw_scale(x)  : pre-softplus scale; sigma = softplus(raw_scale) + 1e-6
+
+    Together (mu, sigma) fully specify the model's predictive
+    distribution:  log(T) | x  ~  N(mu(x), sigma(x)^2)
     """
-    set_seed(seed)
-    Sigma = make_ar1_cov(p, rho=rho) + 1e-8 * np.eye(p)
-    X = np.random.multivariate_normal(mean=np.zeros(p), cov=Sigma, size=n).astype(
-        np.float32
+    inp = Input(shape=(input_dim,), name="x")
+    x = inp
+    for d in range(depth):
+        x = L.Dense(width, activation="tanh", name=f"dense_{d}")(x)
+        x = L.Dropout(dropout, name=f"drop_{d}")(x)
+    out = L.Dense(2, activation=None, name="head_mu_raw")(x)
+    return Model(inp, out, name="DeepGP_AFT")
+
+
+def aft_lognormal_nll(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
+    """
+    Log-normal AFT negative log-likelihood (right-censored).
+
+    Parameters
+    ----------
+    y_true : tensor of shape (batch, 2) = [observed_time, event_indicator]
+    y_pred : tensor of shape (batch, 2) = [mu, raw_scale]
+
+    Returns
+    -------
+    scalar tensor: mean NLL over the batch
+    """
+    y = y_true[:, 0]
+    delta = y_true[:, 1]
+    mu = y_pred[:, 0]
+    sigma = tf.nn.softplus(y_pred[:, 1]) + 1e-6
+
+    y = tf.clip_by_value(y, 1e-30, 1e30)
+    logy = tf.math.log(y)
+    z = (logy - mu) / sigma
+
+    logf = (
+        -tf.math.log(y)
+        - tf.math.log(sigma)
+        - 0.5 * tf.math.log(2.0 * PI)
+        - 0.5 * tf.square(z)
+    )
+    erfc_val = tf.clip_by_value(tf.math.erfc(z / SQRT2), 1e-45, 1.0)
+    logS = LOG_HALF + tf.math.log(erfc_val)
+
+    nll = -(delta * logf + (1.0 - delta) * logS)
+    return tf.reduce_mean(nll)
+
+
+# ===========================================================================
+# 2. Predictive-distribution UQ (MC-Dropout)
+# ===========================================================================
+def predict_mu_sigma_uq(
+    model: Model,
+    X: np.ndarray,
+    mc_passes: int = 30,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Monte-Carlo Dropout inference with aleatoric/epistemic decomposition.
+
+    The model defines log(T) | x ~ N(mu(x), sigma(x)^2). Running
+    MC-dropout gives ``mc_passes`` samples of (mu, sigma) per input
+    (a mixture of Gaussians), which is moment-matched to a single
+    Gaussian (Kendall & Gal, 2017 style).
+
+    Parameters
+    ----------
+    model     : trained keras.Model returned by build_deepgp_aft
+    X         : (N, p) float array of covariates to predict on
+    mc_passes : number of MC-Dropout forward passes
+
+    Returns
+    -------
+    mu_mean          : (N,) predictive mean of log(T)
+    sigma_aleatoric  : (N,) sqrt(E_m[sigma_m^2])   -- data-noise component
+    sigma_epistemic  : (N,) sqrt(Var_m[mu_m])      -- dropout/model
+                       uncertainty component
+    sigma_total       : (N,) sqrt(aleatoric^2 + epistemic^2)
+                        -- use this for prediction intervals
+    """
+    mu_samples = []
+    sigma_samples = []
+    for _ in range(mc_passes):
+        raw = model(X, training=True).numpy()  # dropout stays active
+        mu_samples.append(raw[:, 0])
+        sigma_samples.append(np.log1p(np.exp(raw[:, 1])) + 1e-6)  # softplus
+    mu_samples = np.stack(mu_samples, axis=0)       # (M, N)
+    sigma_samples = np.stack(sigma_samples, axis=0)  # (M, N)
+
+    mu_mean = mu_samples.mean(axis=0)
+    sigma2_aleatoric = (sigma_samples ** 2).mean(axis=0)
+    sigma2_epistemic = mu_samples.var(axis=0)
+    sigma2_total = sigma2_aleatoric + sigma2_epistemic
+
+    return (
+        mu_mean,
+        np.sqrt(sigma2_aleatoric),
+        np.sqrt(sigma2_epistemic),
+        np.sqrt(sigma2_total),
     )
 
-    gX = g_nonlinear(X)
-    eps = np.random.normal(0.0, np.sqrt(sigma), size=n)
-    logT = gX + eps
-    T = np.exp(logT)
 
-    C = np.random.uniform(0, tau, size=n)
-    y = np.minimum(np.minimum(T, C), tau)
-    delta = ((T <= C) & (T <= tau)).astype(np.float32)
+def prediction_interval(
+    mu_pred: np.ndarray,
+    sigma_pred: np.ndarray,
+    alpha: float = 0.05,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    (1 - alpha) prediction interval for log(T) under a Gaussian
+    predictive distribution.
 
-    mu_true = gX.astype(np.float32)
-    sigma_true = np.full_like(mu_true, fill_value=np.sqrt(sigma), dtype=np.float32)
+    Parameters
+    ----------
+    mu_pred    : (N,) predictive mean (e.g. from predict_mu_sigma_uq)
+    sigma_pred : (N,) predictive std to use (e.g. sigma_total)
+    alpha      : miscoverage level (0.05 -> 95% interval)
 
-    return X.astype(np.float32), y.astype(np.float32), delta, mu_true, sigma_true
-
-
-# ---------------------------------------------------------------------------
-# Stratified splitting utilities
-# ---------------------------------------------------------------------------
-def _stratified_train_test_split(
-    df: pd.DataFrame,
-    label_col: str = "delta",
-    train_frac: float = 0.7,
-    seed: int = 0,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Stratified binary-label train/test split."""
-    rng = np.random.default_rng(seed)
-    train_parts, test_parts = [], []
-    for val in sorted(df[label_col].unique()):
-        block = df[df[label_col] == val]
-        idx = block.index.to_numpy()
-        rng.shuffle(idx)
-        n_train = int(np.floor(train_frac * len(idx)))
-        train_parts.append(block.loc[idx[:n_train]])
-        test_parts.append(block.loc[idx[n_train:]])
-    train_df = pd.concat(train_parts).sample(frac=1.0, random_state=seed).reset_index(drop=True)
-    test_df = pd.concat(test_parts).sample(frac=1.0, random_state=seed).reset_index(drop=True)
-    return train_df, test_df
+    Returns
+    -------
+    lower, upper : (N,), (N,) interval bounds on the log(T) scale
+    """
+    z = norm.ppf(1 - alpha / 2)
+    lower = mu_pred - z * sigma_pred
+    upper = mu_pred + z * sigma_pred
+    return lower, upper
 
 
-def _stratified_split(
-    df: pd.DataFrame,
-    label_col: str = "delta",
-    frac: float = 0.5,
-    seed: int = 0,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Return (A, B) where A receives ``frac`` proportion per class."""
-    rng = np.random.default_rng(seed)
-    A_parts, B_parts = [], []
-    for val in sorted(df[label_col].unique()):
-        block = df[df[label_col] == val]
-        idx = block.index.to_numpy()
-        rng.shuffle(idx)
-        n_A = int(np.floor(frac * len(idx)))
-        A_parts.append(block.loc[idx[:n_A]])
-        B_parts.append(block.loc[idx[n_A:]])
-    A = pd.concat(A_parts).sample(frac=1.0, random_state=seed).reset_index(drop=True)
-    B = pd.concat(B_parts).sample(frac=1.0, random_state=seed).reset_index(drop=True)
-    return A, B
+def coverage_at_alpha(
+    logT_true: np.ndarray,
+    mu_pred: np.ndarray,
+    sigma_pred: np.ndarray,
+    alpha: float = 0.05,
+) -> tuple[float, float]:
+    """
+    Empirical coverage of the (1 - alpha) prediction interval.
+
+    Parameters
+    ----------
+    logT_true  : (N,) ground-truth log(T). May contain NaN for rows
+                 without a known true value (e.g. censored rows when
+                 no oracle logT is available) -- these are dropped.
+    mu_pred    : (N,) predictive mean
+    sigma_pred : (N,) predictive std (use sigma_total)
+    alpha      : miscoverage level (0.05 -> 95% interval)
+
+    Returns
+    -------
+    coverage  : fraction of (non-NaN) rows where logT_true falls inside
+                [lower, upper]
+    avg_width : average interval width
+    """
+    logT_true = np.asarray(logT_true, dtype=float)
+    mu_pred = np.asarray(mu_pred, dtype=float)
+    sigma_pred = np.asarray(sigma_pred, dtype=float)
+    ok = np.isfinite(logT_true) & np.isfinite(mu_pred) & np.isfinite(sigma_pred)
+    logT_true, mu_pred, sigma_pred = logT_true[ok], mu_pred[ok], sigma_pred[ok]
+    if len(logT_true) == 0:
+        return np.nan, np.nan
+
+    lower, upper = prediction_interval(mu_pred, sigma_pred, alpha=alpha)
+    inside = (logT_true >= lower) & (logT_true <= upper)
+    return float(inside.mean()), float((upper - lower).mean())
 
 
-# ---------------------------------------------------------------------------
-# IPCW helpers (Kaplan–Meier estimate of the censoring distribution)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# 3. IPCW evaluation metrics
+# ===========================================================================
 def _km_survival_of_censoring(y: np.ndarray, delta: np.ndarray) -> np.ndarray:
-    """Kaplan–Meier estimate of G(t) = P(C > t) evaluated at each observed time."""
+    """Kaplan–Meier estimate of G(t) = P(C > t), evaluated at each y_i."""
     y = np.asarray(y, dtype=float)
     delta = np.asarray(delta, dtype=int)
-    c = 1 - delta  # censoring indicator
+    c = 1 - delta
     uniq = np.unique(y)
     r = np.array([(y >= t).sum() for t in uniq], dtype=float)
     d = np.array([c[y == t].sum() for t in uniq], dtype=float)
@@ -204,9 +269,24 @@ def c_index_ipcw_rstyle(
     y: np.ndarray,
     delta: np.ndarray,
     t_pred: np.ndarray,
-    censor_prob: np.ndarray | None = None,
+    censor_prob: Optional[np.ndarray] = None,
 ) -> float:
-    """IPCW C-index (Uno et al. style)."""
+    """
+    IPCW C-index (Uno et al. style).
+
+    Parameters
+    ----------
+    y           : (N,) observed times
+    delta       : (N,) event indicators
+    t_pred      : (N,) predicted risk score (e.g. predicted median time;
+                  smaller = predicted to fail sooner)
+    censor_prob : optional precomputed G_hat(y_i); if None, estimated
+                  via Kaplan-Meier on the censoring distribution
+
+    Returns
+    -------
+    IPCW C-index (float), or NaN if not enough comparable pairs
+    """
     y = np.asarray(y, dtype=float)
     delta = np.asarray(delta, dtype=int)
     t_pred = np.asarray(t_pred, dtype=float)
@@ -239,9 +319,21 @@ def ipcw_rmse_logT(
     y: np.ndarray,
     delta: np.ndarray,
     mu_hat: np.ndarray,
-    censor_prob: np.ndarray | None = None,
+    censor_prob: Optional[np.ndarray] = None,
 ) -> float:
-    """IPCW-weighted RMSE of log(T).  w_i = delta_i / G_hat(y_i)."""
+    """
+    IPCW-weighted RMSE of log(T):  w_i = delta_i / G_hat(y_i).
+
+    Parameters
+    ----------
+    y, delta    : (N,) observed times / event indicators
+    mu_hat      : (N,) predicted mean of log(T)
+    censor_prob : optional precomputed G_hat(y_i)
+
+    Returns
+    -------
+    IPCW-weighted RMSE (float), or NaN if no events
+    """
     y = np.asarray(y, dtype=float)
     delta = np.asarray(delta, dtype=int)
     mu_hat = np.asarray(mu_hat, dtype=float)
@@ -258,143 +350,61 @@ def ipcw_rmse_logT(
     return float(np.sqrt(num / den)) if den > 0 else np.nan
 
 
-# ---------------------------------------------------------------------------
-# Model architecture & loss
-# ---------------------------------------------------------------------------
-def build_deepgp_aft(
-    input_dim: int = 30,
-    width: int = 128,
-    depth: int = 3,
-    dropout: float = 0.2,
-) -> Model:
+# ===========================================================================
+# 4. Data-splitting utility (model-side train/val split, NOT data generation)
+# ===========================================================================
+def stratified_split(
+    df: pd.DataFrame,
+    label_col: str = "delta",
+    frac: float = 0.5,
+    seed: int = 0,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Deep-GP-like AFT network with MC-Dropout.
+    Split a DataFrame into (A, B), stratified by a binary label column,
+    with A receiving ``frac`` proportion of each class.
 
-    Output head has two units: [mu, raw_scale].
-    sigma = softplus(raw_scale) + 1e-6 ensures positivity.
-    """
-    inp = Input(shape=(input_dim,), name="x")
-    x = inp
-    for d in range(depth):
-        x = L.Dense(width, activation="tanh", name=f"dense_{d}")(x)
-        x = L.Dropout(dropout, name=f"drop_{d}")(x)
-    out = L.Dense(2, activation=None, name="head_mu_raw")(x)
-    return Model(inp, out, name="DeepGP_AFT")
+    Used e.g. to split a 70%-train_pool into a 5/7 train_core and a
+    2/7 val split (giving overall 50%/20%/30% train/val/test).
 
-
-def aft_lognormal_nll(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
-    """
-    Log-normal AFT negative log-likelihood.
-
-    y_true columns: [observed_time, event_indicator]
-    y_pred columns: [mu, raw_scale]
-    """
-    y = y_true[:, 0]
-    delta = y_true[:, 1]
-    mu = y_pred[:, 0]
-    sigma = tf.nn.softplus(y_pred[:, 1]) + 1e-6
-
-    y = tf.clip_by_value(y, 1e-30, 1e30)
-    logy = tf.math.log(y)
-    z = (logy - mu) / sigma
-
-    logf = (
-        -tf.math.log(y)
-        - tf.math.log(sigma)
-        - 0.5 * tf.math.log(2.0 * PI)
-        - 0.5 * tf.square(z)
-    )
-    erfc_val = tf.clip_by_value(tf.math.erfc(z / SQRT2), 1e-45, 1.0)
-    logS = LOG_HALF + tf.math.log(erfc_val)
-
-    nll = -(delta * logf + (1.0 - delta) * logS)
-    return tf.reduce_mean(nll)
-
-
-def predict_mu_sigma(
-    model: Model,
-    X: np.ndarray,
-    mc_passes: int = 30,
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Monte-Carlo Dropout inference.
+    Parameters
+    ----------
+    df        : input DataFrame (must contain label_col)
+    label_col : name of the binary stratification column
+    frac      : proportion assigned to A, per class
+    seed      : random seed for reproducibility
 
     Returns
     -------
-    mu_mean    : (N,) mean predicted log(T) across MC samples
-    sigma_mean : (N,) mean predicted scale across MC samples
+    A, B : two DataFrames (shuffled, index reset)
     """
-    outs = []
-    for _ in range(mc_passes):
-        raw = model(X, training=True).numpy()
-        mu = raw[:, 0]
-        sigma = np.log1p(np.exp(raw[:, 1])) + 1e-6  # softplus
-        outs.append(np.stack([mu, sigma], axis=1))
-    outs = np.stack(outs, axis=0)  # (M, N, 2)
-    return outs[:, :, 0].mean(axis=0), outs[:, :, 1].mean(axis=0)
+    rng = np.random.default_rng(seed)
+    A_parts, B_parts = [], []
+    for val in sorted(df[label_col].unique()):
+        block = df[df[label_col] == val]
+        idx = block.index.to_numpy()
+        rng.shuffle(idx)
+        n_A = int(np.floor(frac * len(idx)))
+        A_parts.append(block.loc[idx[:n_A]])
+        B_parts.append(block.loc[idx[n_A:]])
+    A = pd.concat(A_parts).sample(frac=1.0, random_state=seed).reset_index(drop=True)
+    B = pd.concat(B_parts).sample(frac=1.0, random_state=seed).reset_index(drop=True)
+    return A, B
 
 
-# ---------------------------------------------------------------------------
-# Data generation & persistence
-# ---------------------------------------------------------------------------
-def save_simulations(
-    p: int = 30,
-    sigma: float = 0.5,
-    n: int = 1000,
-    n_sims: int = 5,
-    rho: float = 0.3,
-    tau: float = 10.0,
-    base_seed: int = 1000,
-    outdir: str = "simul",
-    train_frac: float = 0.7,
-) -> Path:
+def df_to_xy(df: pd.DataFrame, p: int) -> tuple[np.ndarray, np.ndarray]:
     """
-    Generate ``n_sims`` datasets and save train / test CSVs.
+    Extract (X, y_target) arrays from a DataFrame.
 
-    Returns the output directory ``Path``.
+    Parameters
+    ----------
+    df : DataFrame with columns x1..xp, y, delta
+    p  : number of covariates
+
+    Returns
+    -------
+    X        : (N, p) float32 covariates
+    y_target : (N, 2) float32, columns = [observed_time, event_indicator]
     """
-    setting_name = f"p{p}_sigma{sigma}_tau{tau}"
-    path = Path(outdir) / setting_name
-    path.mkdir(parents=True, exist_ok=True)
-
-    for k in range(n_sims):
-        seed = base_seed + k
-        print(f"[{setting_name}] Simulation {k + 1}/{n_sims}, seed={seed}")
-        X, y, delta, mu_true, sigma_true = generate_correlated_data(
-            n=n, p=p, sigma=sigma, tau=tau, rho=rho, seed=seed
-        )
-
-        df = pd.DataFrame(X, columns=[f"x{j + 1}" for j in range(p)])
-        df["y"] = y
-        df["delta"] = delta
-        df["mu_true"] = mu_true
-        df["sigma_true"] = sigma_true
-
-        train_df, test_df = _stratified_train_test_split(
-            df, label_col="delta", train_frac=train_frac, seed=seed
-        )
-
-        train_df.to_csv(path / f"seed_{seed}_train.csv", index=False)
-        test_df.to_csv(path / f"seed_{seed}_test.csv", index=False)
-
-        cr_overall = 1.0 - df["delta"].mean()
-        cr_train = 1.0 - train_df["delta"].mean()
-        cr_test = 1.0 - test_df["delta"].mean()
-        print(
-            f"  total n={len(df)} (censoring={cr_overall:.3f}) | "
-            f"train n={len(train_df)} (censoring={cr_train:.3f}) | "
-            f"test n={len(test_df)} (censoring={cr_test:.3f})"
-        )
-
-    print(f"Saved {n_sims} train/test pairs under {path}")
-    return path
-
-
-# ---------------------------------------------------------------------------
-# Training & evaluation
-# ---------------------------------------------------------------------------
-def _df_to_xy(df: pd.DataFrame, p: int) -> tuple[np.ndarray, np.ndarray]:
-    """Extract (X, y_target) arrays from a dataframe."""
     X = df[[f"x{j + 1}" for j in range(p)]].to_numpy(dtype=np.float32)
     y = df["y"].to_numpy(dtype=np.float32)
     d = df["delta"].to_numpy(dtype=np.float32)
@@ -402,217 +412,212 @@ def _df_to_xy(df: pd.DataFrame, p: int) -> tuple[np.ndarray, np.ndarray]:
     return X, y_target
 
 
-def train_and_eval_for_setting(
-    setting_path: Path,
+# ===========================================================================
+# 5. High-level pipeline: fit + evaluate for one train/val/test triple
+# ===========================================================================
+def fit_model(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
     p: int,
-    seeds: list[int] | None = None,
-    model_width: int = 128,
-    model_depth: int = 3,
+    width: int = 128,
+    depth: int = 3,
     dropout: float = 0.2,
     lr: float = 1e-3,
     batch_size: int = 128,
     epochs: int = 500,
-    mc_passes: int = 30,
     patience: int = 20,
-) -> pd.DataFrame:
+    seed: Optional[int] = None,
+) -> Model:
     """
-    Train and evaluate the DeepGP-AFT model for every available seed.
+    Build and train a DeepGP-AFT model.
 
-    If ``seeds`` is None, all seeds found in ``setting_path`` are used.
+    Parameters
+    ----------
+    X_train, y_train : training arrays (y_train columns = [time, delta])
+    X_val, y_val      : validation arrays, used for early stopping / LR decay
+    p                 : number of covariates
+    width, depth, dropout, lr, batch_size, epochs, patience : hyperparameters
+    seed              : optional random seed (sets numpy + tf seeds)
 
-    Returns a DataFrame of per-seed metrics.
+    Returns
+    -------
+    trained keras.Model
     """
-    # discover seeds
-    all_train_files = sorted(setting_path.glob("seed_*_train.csv"))
-    if seeds is not None:
-        seed_set = set(seeds)
-        all_train_files = [
-            f for f in all_train_files
-            if int(f.stem.split("_")[1]) in seed_set
-        ]
+    if seed is not None:
+        set_seed(seed)
+    tf.keras.backend.clear_session()
 
-    metrics_rows = []
+    model = build_deepgp_aft(input_dim=p, width=width, depth=depth, dropout=dropout)
+    model.compile(optimizer=Adam(lr), loss=aft_lognormal_nll)
 
-    for train_csv in all_train_files:
-        seed = int(train_csv.stem.split("_")[1])
-        test_csv = setting_path / f"seed_{seed}_test.csv"
-        if not test_csv.exists():
-            print(f"  [seed={seed}] test file not found – skipping.")
-            continue
-
-        # ------------------------------------------------------------------
-        # Split: train_pool  →  val (2/7)  +  train_core (5/7)
-        # ------------------------------------------------------------------
-        train_pool = pd.read_csv(train_csv)
-        val_df, train_core_df = _stratified_split(
-            train_pool, label_col="delta", frac=2.0 / 7.0, seed=seed
-        )
-        test_df = pd.read_csv(test_csv)
-
-        X_tr, y_tr = _df_to_xy(train_core_df, p)
-        X_va, y_va = _df_to_xy(val_df, p)
-        X_te, y_te = _df_to_xy(test_df, p)
-
-        # ------------------------------------------------------------------
-        # Build & train
-        # ------------------------------------------------------------------
-        tf.keras.backend.clear_session()
-        model = build_deepgp_aft(
-            input_dim=p, width=model_width, depth=model_depth, dropout=dropout
-        )
-        model.compile(optimizer=Adam(lr), loss=aft_lognormal_nll)
-
-        callbacks = [
-            EarlyStopping(patience=patience, restore_best_weights=True, monitor="val_loss"),
-            ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=8, min_lr=1e-5),
-        ]
-
-        t0 = time.time()
-        model.fit(
-            X_tr, y_tr,
-            validation_data=(X_va, y_va),
-            epochs=epochs,
-            batch_size=batch_size,
-            callbacks=callbacks,
-            verbose=0,
-        )
-        runtime = time.time() - t0
-
-        # ------------------------------------------------------------------
-        # Predict & evaluate
-        # ------------------------------------------------------------------
-        mu_hat, _ = predict_mu_sigma(model, X_te, mc_passes=mc_passes)
-        y_test = y_te[:, 0]
-        d_test = y_te[:, 1]
-        medT_hat = np.exp(mu_hat)
-
-        def _rmse(a, b):
-            return float(np.sqrt(np.mean((np.asarray(a) - np.asarray(b)) ** 2)))
-
-        def _mae(a, b):
-            return float(np.mean(np.abs(np.asarray(a) - np.asarray(b))))
-
-        evt = d_test == 1
-        if evt.sum() > 0:
-            rmse_logT = _rmse(np.log(y_test[evt]), mu_hat[evt])
-            mae_logT = _mae(np.log(y_test[evt]), mu_hat[evt])
-            rmse_time_med = _rmse(y_test[evt], medT_hat[evt])
-            mae_time_med = _mae(y_test[evt], medT_hat[evt])
-        else:
-            rmse_logT = mae_logT = rmse_time_med = mae_time_med = np.nan
-
-        ipcw_rmse = ipcw_rmse_logT(y_test, d_test, mu_hat)
-        cindex_ipcw = c_index_ipcw_rstyle(y_test, d_test, medT_hat)
-
-        row = dict(
-            seed=seed,
-            n_test=len(y_test),
-            n_events=int(evt.sum()),
-            rmse_logT=rmse_logT,
-            mae_logT=mae_logT,
-            ipcw_rmse_logT=ipcw_rmse,
-            rmse_time_median=rmse_time_med,
-            mae_time_median=mae_time_med,
-            cindex_median_ipcw=cindex_ipcw,
-            runtime_seconds=runtime,
-        )
-        pd.DataFrame([row]).to_csv(setting_path / f"metrics_seed_{seed}.csv", index=False)
-        metrics_rows.append(row)
-
-        print(
-            f"[{setting_path.name}] seed={seed} | "
-            f"rmse_logT={rmse_logT:.3f}  ipcw_rmse_logT={ipcw_rmse:.3f}  "
-            f"cindex_ipcw={cindex_ipcw:.3f}  ({runtime:.1f}s)"
-        )
-
-    if not metrics_rows:
-        print("No metrics computed – no valid seeds found.")
-        return pd.DataFrame()
-
-    df = pd.DataFrame(metrics_rows)
-    df.to_csv(setting_path / "metrics_summary.csv", index=False)
-
-    agg_cols = [
-        "rmse_logT", "ipcw_rmse_logT", "rmse_time_median",
-        "cindex_median_ipcw", "runtime_seconds",
+    callbacks = [
+        EarlyStopping(patience=patience, restore_best_weights=True, monitor="val_loss"),
+        ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=8, min_lr=1e-5),
     ]
-    print("\nAggregate (mean ± std):")
-    print(df[agg_cols].agg(["mean", "std"]).to_string())
-    return df
-
-
-def infer_p_from_setting(setting_path: Path) -> int:
-    """Infer number of covariates from an arbitrary train CSV in ``setting_path``."""
-    any_train = next(setting_path.glob("seed_*_train.csv"))
-    cols = pd.read_csv(any_train, nrows=1).columns.tolist()
-    return sum(1 for c in cols if c.startswith("x"))
-
-
-# ---------------------------------------------------------------------------
-# CLI entry-point
-# ---------------------------------------------------------------------------
-def _parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(
-        description="Train & evaluate DeepGP-AFT on pre-generated survival data.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    model.fit(
+        X_train, y_train,
+        validation_data=(X_val, y_val),
+        epochs=epochs,
+        batch_size=batch_size,
+        callbacks=callbacks,
+        verbose=0,
     )
-    ap.add_argument(
-        "--setting",
-        type=str,
-        required=True,
-        help="Sub-directory name under --base_dir, e.g. p30_sigma0.5_tau10.0",
+    return model
+
+
+def evaluate_model(
+    model: Model,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
+    logT_true: Optional[np.ndarray] = None,
+    mc_passes: int = 30,
+    alpha: float = 0.05,
+) -> dict:
+    """
+    Evaluate a trained model on a test set: point metrics + predictive
+    UQ (prediction interval + coverage).
+
+    Parameters
+    ----------
+    model     : trained keras.Model
+    X_test    : (N, p) test covariates
+    y_test    : (N, 2) test targets, columns = [observed_time, event_indicator]
+    logT_true : optional (N,) oracle true log(T), used for full-sample
+                coverage. If None, coverage falls back to event-only
+                rows (y == T there).
+    mc_passes : number of MC-Dropout passes
+    alpha     : prediction-interval miscoverage level (0.05 -> 95%)
+
+    Returns
+    -------
+    dict with keys:
+        n_test, n_events,
+        rmse_logT, mae_logT, rmse_time_median, mae_time_median   (event-only),
+        ipcw_rmse_logT, cindex_median_ipcw,
+        coverage_95, avg_pi_width_95,
+        mean_sigma_aleatoric, mean_sigma_epistemic, mean_sigma_total
+    """
+    y_time = y_test[:, 0]
+    d_test = y_test[:, 1]
+
+    mu_hat, sigma_aleatoric, sigma_epistemic, sigma_total = predict_mu_sigma_uq(
+        model, X_test, mc_passes=mc_passes
     )
-    ap.add_argument("--base_dir", type=str, default="simul", help="Root directory for simulations.")
-    ap.add_argument("--first_seed", type=int, default=1000, help="First seed index.")
-    ap.add_argument("--n_seeds", type=int, default=100, help="Number of consecutive seeds to evaluate.")
-    ap.add_argument("--width", type=int, default=128, help="Hidden layer width.")
-    ap.add_argument("--depth", type=int, default=3, help="Number of hidden layers.")
-    ap.add_argument("--dropout", type=float, default=0.2, help="MC-Dropout rate.")
-    ap.add_argument("--lr", type=float, default=1e-3, help="Initial Adam learning rate.")
-    ap.add_argument("--batch_size", type=int, default=128)
-    ap.add_argument("--epochs", type=int, default=500, help="Maximum training epochs.")
-    ap.add_argument("--mc_passes", type=int, default=30, help="MC-Dropout inference passes.")
-    ap.add_argument("--patience", type=int, default=20, help="Early-stopping patience.")
-    return ap.parse_args()
+    medT_hat = np.exp(mu_hat)
 
+    def _rmse(a, b):
+        return float(np.sqrt(np.mean((np.asarray(a) - np.asarray(b)) ** 2)))
 
-def main() -> None:
-    args = _parse_args()
+    def _mae(a, b):
+        return float(np.mean(np.abs(np.asarray(a) - np.asarray(b))))
 
-    setting_path = Path(args.base_dir) / args.setting
-    if not setting_path.exists():
-        raise FileNotFoundError(f"Setting directory not found: {setting_path}")
+    evt = d_test == 1
+    if evt.sum() > 0:
+        rmse_logT = _rmse(np.log(y_time[evt]), mu_hat[evt])
+        mae_logT = _mae(np.log(y_time[evt]), mu_hat[evt])
+        rmse_time_med = _rmse(y_time[evt], medT_hat[evt])
+        mae_time_med = _mae(y_time[evt], medT_hat[evt])
+    else:
+        rmse_logT = mae_logT = rmse_time_med = mae_time_med = np.nan
 
-    p = infer_p_from_setting(setting_path)
-    print(f"Inferred p={p} covariates from {setting_path}")
+    ipcw_rmse = ipcw_rmse_logT(y_time, d_test, mu_hat)
+    cindex_ipcw = c_index_ipcw_rstyle(y_time, d_test, medT_hat)
 
-    candidate_seeds = range(args.first_seed, args.first_seed + args.n_seeds)
-    seeds = [
-        s for s in candidate_seeds
-        if (setting_path / f"seed_{s}_train.csv").exists()
-        and (setting_path / f"seed_{s}_test.csv").exists()
-    ]
-    if not seeds:
-        raise FileNotFoundError(
-            f"No seed_*_train/test.csv files found in {setting_path} "
-            f"for seeds {args.first_seed}..{args.first_seed + args.n_seeds - 1}."
-        )
-    print(f"Found {len(seeds)} seeds: {seeds[0]} … {seeds[-1]}")
+    if logT_true is None:
+        logT_true = np.full_like(mu_hat, np.nan, dtype=np.float32)
+        logT_true[evt] = np.log(y_time[evt])
 
-    train_and_eval_for_setting(
-        setting_path=setting_path,
-        p=p,
-        seeds=seeds,
-        model_width=args.width,
-        model_depth=args.depth,
-        dropout=args.dropout,
-        lr=args.lr,
-        batch_size=args.batch_size,
-        epochs=args.epochs,
-        mc_passes=args.mc_passes,
-        patience=args.patience,
+    coverage_95, avg_pi_width_95 = coverage_at_alpha(
+        logT_true, mu_hat, sigma_total, alpha=alpha
+    )
+
+    return dict(
+        n_test=len(y_time),
+        n_events=int(evt.sum()),
+        rmse_logT=rmse_logT,
+        mae_logT=mae_logT,
+        rmse_time_median=rmse_time_med,
+        mae_time_median=mae_time_med,
+        ipcw_rmse_logT=ipcw_rmse,
+        cindex_median_ipcw=cindex_ipcw,
+        coverage_95=coverage_95,
+        avg_pi_width_95=avg_pi_width_95,
+        mean_sigma_aleatoric=float(np.nanmean(sigma_aleatoric)),
+        mean_sigma_epistemic=float(np.nanmean(sigma_epistemic)),
+        mean_sigma_total=float(np.nanmean(sigma_total)),
     )
 
 
-if __name__ == "__main__":
-    main()
+def train_and_evaluate(
+    train_pool_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    p: int,
+    seed: int = 1000,
+    val_frac_within_train: float = 2.0 / 7.0,
+    width: int = 128,
+    depth: int = 3,
+    dropout: float = 0.2,
+    lr: float = 1e-3,
+    batch_size: int = 128,
+    epochs: int = 500,
+    patience: int = 20,
+    mc_passes: int = 30,
+    alpha: float = 0.05,
+) -> dict:
+    """
+    One-call convenience wrapper: split -> fit -> evaluate, for a single
+    seed / single dataset.
+
+    Parameters
+    ----------
+    train_pool_df : DataFrame with the full (70%) train pool, columns
+                    x1..xp, y, delta (and optionally logT)
+    test_df       : DataFrame with the held-out (30%) test set, same
+                    columns (and optionally logT, used for coverage)
+    p             : number of covariates
+    seed          : random seed (controls both the train/val split and
+                    model initialization)
+    val_frac_within_train : fraction of train_pool assigned to val
+                    (default 2/7, so overall split is 50/20/30)
+    width, depth, dropout, lr, batch_size, epochs, patience : model
+                    hyperparameters
+    mc_passes     : MC-Dropout passes at inference
+    alpha         : prediction-interval level
+
+    Returns
+    -------
+    dict of metrics (see evaluate_model), plus:
+        seed            : the seed used
+        runtime_seconds : wall-clock training time
+    """
+    val_df, train_core_df = stratified_split(
+        train_pool_df, label_col="delta", frac=val_frac_within_train, seed=seed
+    )
+
+    X_tr, y_tr = df_to_xy(train_core_df, p)
+    X_va, y_va = df_to_xy(val_df, p)
+    X_te, y_te = df_to_xy(test_df, p)
+
+    t0 = time.time()
+    model = fit_model(
+        X_tr, y_tr, X_va, y_va, p=p,
+        width=width, depth=depth, dropout=dropout,
+        lr=lr, batch_size=batch_size, epochs=epochs, patience=patience,
+        seed=seed,
+    )
+    runtime = time.time() - t0
+
+    logT_true = (
+        test_df["logT"].to_numpy(dtype=np.float32)
+        if "logT" in test_df.columns
+        else None
+    )
+
+    metrics = evaluate_model(
+        model, X_te, y_te, logT_true=logT_true, mc_passes=mc_passes, alpha=alpha
+    )
+    metrics["seed"] = seed
+    metrics["runtime_seconds"] = runtime
+    return metrics
