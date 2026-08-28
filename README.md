@@ -53,8 +53,9 @@ g(x)=x_1x_2+0.5x_3^2+\sin(\pi x_4/2)-0.8x_5
 $$
 
 and the weights decrease linearly from 0.2 to -0.1. Censoring times follow
-$C_i\sim\operatorname{Uniform}(0,\tau)$, with
-$Y_i=\min(T_i,C_i)$ and $\delta_i=I(T_i\le C_i)$.
+$C_i \sim \mathrm{Uniform}(0, \tau)$, with
+$Y_i = \min(T_i, C_i)$ and
+$\delta_i = \mathbf{1}(T_i \le C_i)$.
 
 Example: generate 100 replicates for one scenario (seeds 1000-1099).
 
