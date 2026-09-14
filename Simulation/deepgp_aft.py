@@ -86,11 +86,20 @@ def mc_draws(model, x, samples):
                      for _ in range(samples)], axis=0)
 
 
-def event_residual_variance(observed, event, prediction):
-    keep = event == 1
-    if not keep.any():
-        raise ValueError("No uncensored training observations")
-    return float(np.mean((np.log(observed[keep]) - prediction[keep]) ** 2))
+def model_sigma(model):
+    """Global residual scale learned under the censored likelihood."""
+    raw = model.get_layer("global_raw_sigma").raw_sigma
+    return float(tf.nn.softplus(raw).numpy() + EPS)
+
+
+def residual_variance(observed, prediction):
+    """Naive log-scale residual variance over all subjects (diagnostic only).
+
+    Censored rows contribute log(C) - mu rather than log(T) - mu, so this is a
+    biased estimate of the noise scale. It is reported for monitoring only and
+    is not used to build predictive intervals.
+    """
+    return float(np.mean((np.log(observed) - prediction) ** 2))
 
 
 def censoring_survival_before(times, event):
@@ -133,8 +142,9 @@ def fit_seed(setting, seed, args):
     train_draw, test_draw = (mc_draws(model, x_train, args.mc_samples),
                              mc_draws(model, x_test, args.mc_samples))
     train_mean, test_mean = train_draw.mean(0), test_draw.mean(0)
-    residual_var = event_residual_variance(y_train[:, 0], y_train[:, 1], train_mean)
-    total_sd = np.sqrt(residual_var + test_draw.var(0))
+    sigma = model_sigma(model)
+    epistemic_var = test_draw.var(0, ddof=1)
+    total_sd = np.sqrt(sigma ** 2 + epistemic_var)
     lower, upper = test_mean - Z975 * total_sd, test_mean + Z975 * total_sd
     return {"seed": seed,
             "rmse": float(np.sqrt(np.mean((test_mean - true_log_t) ** 2))),
@@ -144,7 +154,9 @@ def fit_seed(setting, seed, args):
             "epochs_trained": len(history.history["loss"]),
             "n_train": len(x_train), "n_test": len(x_test),
             "n_test_events": int(y_test[:, 1].sum()), "p": len(columns),
-            "residual_variance": residual_var,
+            "sigma": sigma,
+            "mean_epistemic_variance": float(epistemic_var.mean()),
+            "residual_variance": residual_variance(y_train[:, 0], train_mean),
             "runtime_seconds": float(time.perf_counter() - started)}
 
 
@@ -195,6 +207,8 @@ def main():
     parser.add_argument("--require-all-seeds", action="store_true")
     parser.add_argument("--verbose", type=int, choices=[0, 1, 2], default=0)
     args = parser.parse_args()
+    if args.mc_samples < 2:
+        parser.error("--mc-samples must be at least 2 for an unbiased variance")
     settings = ([args.dir] if args.dir else
                 sorted(path for path in args.root.iterdir()
                        if path.is_dir() and path.name.startswith("n")))
